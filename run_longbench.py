@@ -75,8 +75,8 @@ model2prompt = {
 model2maxlen = {
     "llama2": 3950,
     "llama-2": 3950,
-    "llama3": 7950,
-    "llama-3": 7950,
+    "llama3": 130000,
+    "llama-3": 130000,
     "mistral": 31500
 }
 
@@ -148,6 +148,12 @@ def main(args):
 
             if "llama2" in args.model_path.lower():
                 prompt = build_chat(prompt)
+
+            elif "llama3" in args.model_path.lower() and (
+                # chat models are better off without build prompts on these tasks
+                args.dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]
+            ):
+                prompt = build_chat_llama3(prompt)
 
             example["prompt"] = prompt
 
