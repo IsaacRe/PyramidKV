@@ -15,8 +15,70 @@ from transformers.utils import (
 )
 from pyramidkv.pyramidkv_utils import init_pyramidkv,init_snapkv,init_H2O,init_StreamingLLM
 import math
+from flash_attn import flash_attn_func, flash_attn_varlen_func
+from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
 
 logger = logging.get_logger(__name__)
+
+
+def _flash_attention_forward(
+    self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
+):
+    """
+    Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
+    first unpad the input, then computes the attention scores and pad the final attention scores.
+
+    Args:
+        query_states (`torch.Tensor`):
+            Input query states to be passed to Flash Attention API
+        key_states (`torch.Tensor`):
+            Input key states to be passed to Flash Attention API
+        value_states (`torch.Tensor`):
+            Input value states to be passed to Flash Attention API
+        attention_mask (`torch.Tensor`):
+            The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
+            position of padding tokens and 1 for the position of non-padding tokens.
+        dropout (`float`):
+            Attention dropout
+        softmax_scale (`float`, *optional*):
+            The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
+    """
+    if not self._flash_attn_uses_top_left_mask:
+        causal = self.is_causal
+    else:
+        # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in LlamaFlashAttention2 __init__.
+        causal = self.is_causal and query_length != 1
+
+    # Contains at least one padding token in the sequence
+    if attention_mask is not None:
+        batch_size = query_states.shape[0]
+        query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+            query_states, key_states, value_states, attention_mask, query_length
+        )
+
+        cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+        max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+
+        attn_output_unpad = flash_attn_varlen_func(
+            query_states,
+            key_states,
+            value_states,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_in_batch_q,
+            max_seqlen_k=max_seqlen_in_batch_k,
+            dropout_p=dropout,
+            softmax_scale=softmax_scale,
+            causal=causal,
+        )
+
+        attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+    else:
+        attn_output = flash_attn_func(
+            query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
+        )
+
+    return attn_output
 
 
 def llama_attn_forward_PyramidKV(
@@ -70,7 +132,7 @@ def llama_attn_forward_PyramidKV(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
-        if hasattr(self, "kv_seq_len"): 
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -167,7 +229,7 @@ def llama_sdpa_attn_forward_PyramidKV(
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    
+
     kv_seq_len = key_states.shape[-2]
     # if past_key_value is not None:
     #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -178,7 +240,7 @@ def llama_sdpa_attn_forward_PyramidKV(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
-        if hasattr(self, "kv_seq_len"): 
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -246,7 +308,7 @@ def llama_flash_attn2_forward_PyramidKV(
     use_cache: bool = False,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    
+
     init_pyramidkv(self, num_hidden_layers=self.config.num_hidden_layers)
     # LlamaFlashAttention2 attention does not support output_attentions
     if "padding_mask" in kwargs:
@@ -271,7 +333,7 @@ def llama_flash_attn2_forward_PyramidKV(
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    
+
     kv_seq_len = key_states.shape[-2]
     # if past_key_value is not None:
     #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -282,7 +344,7 @@ def llama_flash_attn2_forward_PyramidKV(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
-        if hasattr(self, "kv_seq_len"): 
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -300,18 +362,18 @@ def llama_flash_attn2_forward_PyramidKV(
         # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         # print('kv_seq_len:', kv_seq_len)
         # print('key_states.shape:', key_states.shape)
-        
+
         # print(f"self.layer_idx {self.layer_idx}")
         # print(f"key_states {key_states.device}")
         # print(f"value_states {value_states.device}")
-        
+
         # if self.layer_idx < len(past_key_value.key_cache):
         #     for index in range(len(past_key_value.key_cache)):
         #         print(f"past_key_value.key_cache[{index}] {past_key_value.key_cache[index].device}")
         #         print(f"past_key_value.value_cache[{index}] {past_key_value.value_cache[index].device}")
-        
-        if key_states.shape[-2] == kv_seq_len: 
-            self.kv_seq_len = kv_seq_len 
+
+        if key_states.shape[-2] == kv_seq_len:
+            self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
             past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
         else:
@@ -320,7 +382,7 @@ def llama_flash_attn2_forward_PyramidKV(
 
         # print(f"after self.key_cache[layer_idx] {past_key_value.key_cache[self.layer_idx].device}")
         # print(f"after self.value_states[layer_idx] {past_key_value.value_cache[self.layer_idx].device}")
-    
+
 
     # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
     # to be able to avoid many of these transpose/reshape/view.
@@ -356,8 +418,8 @@ def llama_flash_attn2_forward_PyramidKV(
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
 
-    attn_output = self._flash_attention_forward(
-        query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+    attn_output = _flash_attention_forward(
+        self, query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
     )
 
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
@@ -420,7 +482,7 @@ def llama_attn_forward_H2O(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
-        if hasattr(self, "kv_seq_len"): 
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -529,7 +591,7 @@ def llama_sdpa_attn_forward_H2O(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
-        if hasattr(self, "kv_seq_len"): 
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -621,7 +683,7 @@ def llama_flash_attn2_forward_H2O(
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    
+
     kv_seq_len = key_states.shape[-2]
     # if past_key_value is not None:
     #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -757,7 +819,7 @@ def llama_attn_forward_StreamingLLM(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
-        if hasattr(self, "kv_seq_len"): 
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -866,7 +928,7 @@ def llama_sdpa_attn_forward_StreamingLLM(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
-        if hasattr(self, "kv_seq_len"): 
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -957,7 +1019,7 @@ def llama_flash_attn2_forward_StreamingLLM(
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    
+
     kv_seq_len = key_states.shape[-2]
     # if past_key_value is not None:
     #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -1093,7 +1155,7 @@ def llama_attn_forward_SnapKV(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
-        if hasattr(self, "kv_seq_len"): 
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -1202,7 +1264,7 @@ def llama_sdpa_attn_forward_SnapKV(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
-        if hasattr(self, "kv_seq_len"): 
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -1294,7 +1356,7 @@ def llama_flash_attn2_forward_SnapKV(
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    
+
     kv_seq_len = key_states.shape[-2]
     # if past_key_value is not None:
     #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -1382,8 +1444,8 @@ def llama_flash_attn2_forward_SnapKV(
 def prepare_inputs_for_generation_llama(
     self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
 ):
-    
-    
+
+
     if past_key_values is None:
         for layer in self.model.layers:
             layer.self_attn.kv_seq_len = 0
@@ -1407,8 +1469,8 @@ def prepare_inputs_for_generation_llama(
         # input_ids based on the past_length.
         elif past_length < input_ids.shape[1]:
             input_ids = input_ids[:, past_length:]
-            
-            
+
+
         # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
 
         # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
@@ -1425,9 +1487,9 @@ def prepare_inputs_for_generation_llama(
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
         if past_key_values:
-            
-            
-            
+
+
+
             position_ids = position_ids[:, -input_ids.shape[1] :]
 
     # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
