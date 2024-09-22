@@ -43,6 +43,7 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--results_dir', type=str, default=None)
     parser.add_argument('--longbench_e', action='store_true', help="Evaluate on LongBench-E")
+    parser.add_argument('--cache-size', type=int, default=128)
     return parser.parse_args(args)
 
 def scorer_e(dataset, predictions, answers, lengths, all_classes):
@@ -76,7 +77,7 @@ def scorer(dataset, predictions, answers, all_classes):
 
 if __name__ == '__main__':
     args = parse_args()
-    
+
     dataset_list = [
         "narrativeqa",
         "qasper",
@@ -95,7 +96,7 @@ if __name__ == '__main__':
         "lcc",
         "repobench-p"
         ]
-    
+
     results_list = [
         ["dataset"],
         ["FullKV"],
@@ -105,20 +106,20 @@ if __name__ == '__main__':
         ["H2O"],
         ["PyramidKV"],
     ]
-    
+
     for dataset in dataset_list:
-        
+
         results_list[0].append(dataset)
-        
+
         for idx, method in enumerate(["FullKV", "random", "SnapKV", "StreamingLLM", "H2O", "PyramidKV"]):
         # for idx, method in enumerate(["H2_global", "PyramidKV_global", "local"]):
             try:
                 args.method = method
                 args.dataset = dataset
-                args.eval_file = os.path.join(args.results_dir,dataset,f"{method}.json")
-                
+                args.eval_file = os.path.join(args.results_dir,f"{args.dataset}-{args.method}_{args.cache_size}.json")
+
                 # try:
-                
+
                 scores = dict()
                 # if args.longbench_e:
                 #     path = f"pred_e/{args.model}/"
@@ -126,7 +127,7 @@ if __name__ == '__main__':
                 #     path = f"pred_e/{args.model}/"
                 # all_files = os.listdir(path)
                 # print("Evaluating on:", all_files)
-                
+
                 # for filename in all_files:
                     # if not filename.endswith("jsonl"):
                     #     continue
@@ -152,7 +153,7 @@ if __name__ == '__main__':
                 scores[args.dataset] = score
                     # if dataset == 'qasper':
                     #     scores[dataset + '_e'] = score_e
-                    
+
                 # if args.longbench_e:
                 #     out_path = f"H2O/results/{args.model}/result.json"
                 # else:
@@ -160,21 +161,21 @@ if __name__ == '__main__':
                     # out_path_e = f"pred/{args.model}/result_e.json"
                     # with open(out_path_e, "w") as f:
                     #     json.dump(score_e, f, ensure_ascii=False, indent=4)
-                    
+
                 output_dir = os.path.dirname(args.eval_file)
-                
+
                 results_list[idx+1].append(score)
-                
+
                 with open(os.path.join(output_dir, "metrics.json"), "w") as f:
                     json.dump(scores, f, ensure_ascii=False, indent=4)
-            
+
                 print(f"dataset {args.dataset} method {args.method} scores {scores}")
             except:
-                
+
                 results_list[idx+1].append(-1)
-                
+
                 print(f"dataset {args.dataset} method {args.method} scores {None}")
-                
+
     import csv
     with open(os.path.join(args.results_dir,f"results.csv"), 'w') as fp:
         writer = csv.writer(fp)

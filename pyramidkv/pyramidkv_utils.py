@@ -23,13 +23,13 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class PyramidKVCluster():
     def __init__(self, num_hidden_layers = 32, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', beta = 20, num_layers = 80, layer_idx=None):
-        
+
         self.layer_idx = layer_idx
         self.num_hidden_layers = num_hidden_layers
-        
+
         self.steps = -1
         self.beta = beta
-        
+
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -44,25 +44,25 @@ class PyramidKVCluster():
         self.pooling = pooling
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        
+
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
-        
+
         # TODO
         # window_sizes = 32
         min_num = (self.max_capacity_prompt - self.window_size) // self.beta
         max_num = (self.max_capacity_prompt - self.window_size) * 2 - min_num
-        
-            
+
+
         if max_num >= q_len - self.window_size:
             max_num = q_len - self.window_size
             min_num = (self.max_capacity_prompt - self.window_size) * 2 - max_num
-    
-       
+
+
         steps = (max_num - min_num) // self.num_hidden_layers
         max_capacity_prompt = max_num - self.layer_idx * steps
-        
+
         print(f"PyramidKV max_capacity_prompt {max_capacity_prompt}")
         if q_len < self.max_capacity_prompt:
             return key_states, value_states
@@ -136,14 +136,14 @@ class SnapKVCluster():
         self.kernel_size = kernel_size
         self.pooling = pooling
 
-    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        
+    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups, debug=False):
+
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
-        
+
         print(f"SnapKV max_capacity_prompt {self.max_capacity_prompt}")
-        
+
         if q_len < self.max_capacity_prompt:
             return key_states, value_states
         else:
@@ -158,6 +158,8 @@ class SnapKVCluster():
 
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_weights_sum = attn_weights[:, :, -self.window_size:, : -self.window_size].sum(dim = -2)
+            if debug:
+                import pdb; pdb.set_trace()
             if self.pooling == 'avgpool':
                 attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
             elif self.pooling == 'maxpool':
@@ -191,13 +193,13 @@ class H2OKVCluster():
         self.pooling = pooling
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        
+
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
-        
+
         print(f"H2O max_capacity_prompt {self.max_capacity_prompt}")
-        
+
         if q_len < self.max_capacity_prompt:
             return key_states, value_states
         else:
@@ -246,13 +248,13 @@ class StreamingLLMKVCluster():
         self.pooling = pooling
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        
+
         # check if prefix phase
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
-        
+
         print(f"StreamingLLM max_capacity_prompt {self.max_capacity_prompt}")
-        
+
         if q_len < self.max_capacity_prompt:
             return key_states, value_states
         else:
@@ -275,8 +277,8 @@ class StreamingLLMKVCluster():
             #     raise ValueError('Pooling method not supported')
             # attn_cache = attn_weights_sum
             # indices = attn_cache.topk(self.max_capacity_prompt - self.window_size, dim=-1).indices
-            
-            
+
+
             indices = torch.tensor(range(self.max_capacity_prompt - self.window_size), dtype=torch.int64).to(key_states.device)
             indices = indices.unsqueeze(0).unsqueeze(0).unsqueeze(-1).repeat(bsz, num_heads, 1, head_dim)
 
@@ -299,17 +301,17 @@ def init_pyramidkv(self, num_hidden_layers):
             self.config.kernel_size = 5
         if not hasattr(self.config, 'pooling'):
             self.config.pooling = 'avgpool'
-    
-    
-    self.kv_cluster = PyramidKVCluster( 
+
+
+    self.kv_cluster = PyramidKVCluster(
         num_hidden_layers = num_hidden_layers,
         layer_idx = self.layer_idx,
-        window_size = self.config.window_size, 
-        max_capacity_prompt = self.config.max_capacity_prompt, 
+        window_size = self.config.window_size,
+        max_capacity_prompt = self.config.max_capacity_prompt,
         kernel_size = self.config.kernel_size,
         pooling = self.config.pooling
         )
- 
+
 def init_snapkv(self):
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
@@ -320,11 +322,11 @@ def init_snapkv(self):
             self.config.kernel_size = 5
         if not hasattr(self.config, 'pooling'):
             self.config.pooling = 'avgpool'
-    
-    
-    self.kv_cluster = SnapKVCluster( 
-        window_size = self.config.window_size, 
-        max_capacity_prompt = self.config.max_capacity_prompt, 
+
+
+    self.kv_cluster = SnapKVCluster(
+        window_size = self.config.window_size,
+        max_capacity_prompt = self.config.max_capacity_prompt,
         kernel_size = self.config.kernel_size,
         pooling = self.config.pooling
         )
@@ -339,11 +341,11 @@ def init_H2O(self):
             self.config.kernel_size = 5
         if not hasattr(self.config, 'pooling'):
             self.config.pooling = 'avgpool'
-    
-    
+
+
     self.kv_cluster = H2OKVCluster(
-        window_size = self.config.window_size, 
-        max_capacity_prompt = self.config.max_capacity_prompt, 
+        window_size = self.config.window_size,
+        max_capacity_prompt = self.config.max_capacity_prompt,
         kernel_size = self.config.kernel_size,
         pooling = self.config.pooling
         )
@@ -358,11 +360,11 @@ def init_StreamingLLM(self):
             self.config.kernel_size = 5
         if not hasattr(self.config, 'pooling'):
             self.config.pooling = 'avgpool'
-    
-    
+
+
     self.kv_cluster = StreamingLLMKVCluster(
-        window_size = self.config.window_size, 
-        max_capacity_prompt = self.config.max_capacity_prompt, 
+        window_size = self.config.window_size,
+        max_capacity_prompt = self.config.max_capacity_prompt,
         kernel_size = self.config.kernel_size,
         pooling = self.config.pooling
         )

@@ -149,11 +149,14 @@ def main(args):
             if "llama2" in args.model_path.lower():
                 prompt = build_chat(prompt)
 
-            elif "llama3" in args.model_path.lower() and (
+            elif "llama-3" in args.model_path.lower() and (
                 # chat models are better off without build prompts on these tasks
-                args.dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]
+                args.dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p", "passage_count"]
             ):
+                print(f"using template for {args.dataset}")
                 prompt = build_chat_llama3(prompt)
+            else:
+                print(f"NOT using template for {args.dataset}")
 
             example["prompt"] = prompt
 
@@ -184,9 +187,9 @@ def main(args):
 
     model_name = model_path.split("/")[-1]
 
-    os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset), exist_ok=True)
+    os.makedirs(args.save_dir, exist_ok=True)
 
-    fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", args.dataset, f"{args.method}.json"), "w")
+    fout = open(os.path.join(args.save_dir, f"{args.dataset}-{args.method}_{args.max_capacity_prompts}.json"), "w")
 
     for i in tqdm(range(0, len(prompts), args.eval_batch_size)):
 
@@ -250,6 +253,7 @@ def main(args):
 
         context_length = batch_input_ids.shape[-1]
 
+        # import pdb; pdb.set_trace()
         output = model.generate(
             **tokenized_prompts,
             output_attentions = args.output_attentions,
@@ -348,8 +352,16 @@ if __name__ == "__main__":
     replace_llama(args.method.lower())
     replace_mistral(args.method.lower())
 
+    if 'llama-3' in args.model_path.lower():
+        revision = '5206a32e0bd3067aef1ce90f5528ade7d866253f'
+    elif 'mistral' in args.model_path.lower():
+        revision = 'b70aa86578567ba3301b21c8a27bea4e8f6d6d61'
+    else:
+        raise ValueError('Invalid model')
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
+        revision=revision,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
@@ -371,10 +383,11 @@ if __name__ == "__main__":
 
     save_dir = args.save_dir
 
+    args.data_file = f"data/LongBench/{args.dataset}.jsonl"
 
     max_capacity_prompts = args.max_capacity_prompts
 
-
+    # main(args)
 
 
 
